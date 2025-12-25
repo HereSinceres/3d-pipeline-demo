@@ -1,145 +1,332 @@
-import * as THREE from 'three';
-import { Port } from './Port';
-import { NodeRuntime } from '../runtime/NodeRuntime';
-import { NodeState } from '../runtime/NodeState';
+import * as THREE from "three";
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import type { PortSpecV1 } from "../runtime/workerProtocol";
+import { Port } from "./Port";
 
-export class BasicNode extends THREE.Object3D {
-  readonly body: THREE.Mesh;
-  readonly input: Port;
-  readonly output: Port;
+/**
+ * Basic processing node
+ * - 1 input
+ * - 1 output
+ */
+export class BasicNode extends THREE.Group {
+  private static modelPromise: Promise<{
+    scene: THREE.Object3D;
+    animations: THREE.AnimationClip[];
+  }> | null = null;
 
-  readonly runtime = new NodeRuntime();
+  // ports
+  private ports: Port[] = [];
+  private portMap = new Map<string, Port>();
+  public inputs: PortSpecV1[] = [];
+  public outputs: PortSpecV1[] = [];
 
+  // visuals
+  private body: THREE.Mesh;
+  private modelGroup: THREE.Group;
+  private modelUrl?: string;
+  private mixer: THREE.AnimationMixer | null = null;
+  private actions = new Map<string, THREE.AnimationAction>();
+  private activeClip: string | null = null;
+  private visualState: "normal" | "warn" | "alert" = "normal";
+  private running = true;
   private labelSprite: THREE.Sprite;
-  private labelText = '';
+  private debugSprite: THREE.Sprite;
 
-  constructor(label: string, color = 0x64748b) {
+  constructor(
+    id: string,
+    modelUrl?: string,
+    ports?: { inputs?: PortSpecV1[]; outputs?: PortSpecV1[] }
+  ) {
     super();
+    this.userData.id = id;
+    this.modelUrl = modelUrl;
 
-    const geo = new THREE.BoxGeometry(2.2, 1.2, 2.2);
-    const mat = new THREE.MeshStandardMaterial({
-      color,
-      metalness: 0.25,
-      roughness: 0.65,
-      emissive: 0x000000,
-      emissiveIntensity: 0.8,
+    /* =============================
+     * Body
+     * =========================== */
+
+    const bodyGeo = new THREE.BoxGeometry(2.2, 1.2, 1.6);
+    const bodyMat = new THREE.MeshStandardMaterial({
+      color: 0x1f2937,
+      roughness: 0.6,
+      metalness: 0.1,
     });
-
-    this.body = new THREE.Mesh(geo, mat);
+    this.body = new THREE.Mesh(bodyGeo, bodyMat);
+    this.body.castShadow = true;
+    this.body.receiveShadow = true;
     this.add(this.body);
 
-    this.input = new Port('in');
-    this.input.position.set(-1.4, 0, 0);
-    this.body.add(this.input);
+    this.modelGroup = new THREE.Group();
+    this.add(this.modelGroup);
+    this.loadModel();
 
-    this.output = new Port('out');
-    this.output.position.set(1.4, 0, 0);
-    this.body.add(this.output);
+    this.buildPorts(id, ports);
 
-    this.labelSprite = makeTextSprite(label);
-    this.labelSprite.position.set(0, 1.4, 0);
+    /* =============================
+     * Label
+     * =========================== */
+
+    this.labelSprite = this.createTextSprite(id, 0xffffff);
+    this.labelSprite.position.set(0, 0.9, 0);
     this.add(this.labelSprite);
+
+    /* =============================
+     * Debug text
+     * =========================== */
+
+    this.debugSprite = this.createTextSprite("", 0x94a3b8);
+    this.debugSprite.position.set(0, -0.9, 0);
+    this.add(this.debugSprite);
   }
 
-  updateVisualByState() {
-    const mat = this.body.material as THREE.MeshStandardMaterial;
+  /* =========================================================
+   * Public API
+   * ======================================================= */
 
-    switch (this.runtime.state) {
-      case NodeState.IDLE:
-        mat.color.setHex(0x64748b);
-        mat.emissive.setHex(0x000000);
-        break;
-      case NodeState.RUNNING:
-        mat.color.setHex(0x475569);
-        mat.emissive.setHex(0x22c55e);
-        break;
-      case NodeState.BLOCKED:
-        mat.color.setHex(0x7f1d1d);
-        mat.emissive.setHex(0xef4444);
-        break;
+  /** 用于 TransformControls */
+  getDraggable(): THREE.Object3D {
+    return this;
+  }
+
+  getPorts() {
+    return this.ports;
+  }
+
+  getPortById(id: string) {
+    return this.portMap.get(id);
+  }
+
+  /** 设置显示名称（label） */
+  setLabelText(text: string) {
+    this.updateSpriteText(this.labelSprite, text, 0xffffff);
+  }
+
+  /** 设置调试文本（如 in/out 数量） */
+  setDebugText(text: string) {
+    this.updateSpriteText(this.debugSprite, text, 0x94a3b8);
+  }
+
+  setVisualState(state: "normal" | "warn" | "alert") {
+    this.visualState = state;
+    const applyToMesh = (mesh: THREE.Mesh) => {
+      const mat = mesh.material as THREE.MeshStandardMaterial;
+      if (!mat || !mat.isMeshStandardMaterial) return;
+
+      if (!mesh.userData) mesh.userData = {};
+      let base = mesh.userData.baseMat as
+        | {
+            color: THREE.Color;
+            emissive: THREE.Color;
+            emissiveIntensity: number;
+            roughness: number;
+            metalness: number;
+          }
+        | undefined;
+      if (!base) {
+        base = {
+          color: mat.color.clone(),
+          emissive: mat.emissive.clone(),
+          emissiveIntensity: mat.emissiveIntensity,
+          roughness: mat.roughness,
+          metalness: mat.metalness,
+        };
+        mesh.userData.baseMat = base;
+      }
+
+      if (state === "normal") {
+        mat.color.copy(base.color);
+        mat.emissive.copy(base.emissive);
+        mat.emissiveIntensity = base.emissiveIntensity;
+        mat.roughness = base.roughness;
+        mat.metalness = base.metalness;
+        return;
+      }
+
+      if (state === "warn") {
+        mat.color.setHex(0xf59e0b);
+        mat.emissive.setHex(0x92400e);
+        mat.emissiveIntensity = 0.35;
+        mat.roughness = 0.5;
+        return;
+      }
+
+      mat.color.setHex(0xff0000);
+      mat.emissive.setHex(0xff0000);
+      mat.emissiveIntensity = 0.4;
+      mat.roughness = 0.45;
+    };
+
+    this.modelGroup.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (mesh.isMesh) applyToMesh(mesh);
+    });
+
+    applyToMesh(this.body);
+  }
+
+  setRunning(running: boolean) {
+    this.running = running;
+  }
+
+  setAnimationByName(name: string | null) {
+    if (!this.mixer) return;
+    if (this.activeClip === name) return;
+
+    const next = name ? this.actions.get(name) : null;
+    if (!next) {
+      this.actions.forEach((a) => a.stop());
+      this.activeClip = null;
+      return;
+    }
+
+    this.actions.forEach((a) => {
+      if (a !== next) a.stop();
+    });
+    next.reset().play();
+    this.activeClip = name;
+  }
+
+  update(dt: number) {
+    if (this.mixer && this.running) this.mixer.update(dt);
+  }
+
+  /* =========================================================
+   * Helpers
+   * ======================================================= */
+
+  private createTextSprite(text: string, color: number): THREE.Sprite {
+    const canvas = document.createElement("canvas");
+    canvas.width = 256;
+    canvas.height = 128;
+
+    const ctx = canvas.getContext("2d")!;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    ctx.font = "28px sans-serif";
+    ctx.fillStyle = "#ffffff";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.minFilter = THREE.LinearFilter;
+
+    const mat = new THREE.SpriteMaterial({
+      map: tex,
+      transparent: true,
+      depthTest: false,
+    });
+
+    const sprite = new THREE.Sprite(mat);
+    sprite.scale.set(2.8, 1.4, 1);
+    return sprite;
+  }
+
+  private updateSpriteText(sprite: THREE.Sprite, text: string, color: number) {
+    const tex = sprite.material.map as THREE.CanvasTexture;
+    const canvas = tex.image as HTMLCanvasElement;
+    const ctx = canvas.getContext("2d")!;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.font = "28px sans-serif";
+    ctx.fillStyle = `#${color.toString(16).padStart(6, "0")}`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+
+    tex.needsUpdate = true;
+  }
+
+  private buildPorts(
+    nodeId: string,
+    spec?: { inputs?: PortSpecV1[]; outputs?: PortSpecV1[] }
+  ) {
+    const inputs = spec?.inputs?.length
+      ? spec.inputs
+      : [{ id: "in", direction: "in", position: { x: -1.3, y: 0.0, z: 0.0 } }];
+    const outputs = spec?.outputs?.length
+      ? spec.outputs
+      : [{ id: "out", direction: "out", position: { x: 1.3, y: 0.0, z: 0.0 } }];
+
+    this.inputs = inputs;
+    this.outputs = outputs;
+
+    for (const p of [...inputs, ...outputs]) {
+      const port = new Port(p.direction);
+      port.position.set(p.position.x, p.position.y, p.position.z);
+      port.userData = {
+        kind: "port",
+        portType: p.direction === "in" ? "input" : "output",
+        nodeId,
+        portId: p.id,
+      };
+      this.ports.push(port);
+      this.portMap.set(p.id, port);
+      this.add(port);
     }
   }
 
-  /** 显示 buffer 数值（可选但强烈建议） */
-  setDebugText(text: string) {
-    if (text === this.labelText) return;
-    this.labelText = text;
+  private loadModel() {
+    const url = this.modelUrl ?? "/models/engine.glb";
 
-    // recreate sprite texture
-    const oldMat = this.labelSprite.material as THREE.SpriteMaterial;
-    const oldMap = oldMat.map;
-    if (oldMap) oldMap.dispose();
-    oldMat.dispose();
+    if (!BasicNode.modelPromise || (BasicNode as any).modelUrl !== url) {
+      const loader = new GLTFLoader();
+      BasicNode.modelPromise = new Promise((resolve, reject) => {
+        loader.load(
+          url,
+          (gltf) => resolve({ scene: gltf.scene, animations: gltf.animations }),
+          undefined,
+          (err) => reject(err)
+        );
+      });
+      (BasicNode as any).modelUrl = url;
+    }
 
-    this.remove(this.labelSprite);
-    this.labelSprite = makeTextSprite(text);
-    this.labelSprite.position.set(0, 1.4, 0);
-    this.add(this.labelSprite);
+    BasicNode.modelPromise
+      .then(({ scene, animations }) => {
+        const instance = scene.clone(true);
+        instance.traverse((obj) => {
+          const mesh = obj as THREE.Mesh;
+          if (mesh.isMesh) {
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+          }
+        });
+
+        const box = new THREE.Box3().setFromObject(instance);
+        const size = new THREE.Vector3();
+        box.getSize(size);
+        const max = Math.max(size.x, size.y, size.z);
+        const scale = max > 0 ? 2.2 / max : 1;
+        instance.scale.setScalar(scale);
+
+        const box2 = new THREE.Box3().setFromObject(instance);
+        const center = new THREE.Vector3();
+        box2.getCenter(center);
+        instance.position.sub(center);
+
+        const box3 = new THREE.Box3().setFromObject(instance);
+        instance.position.y += -0.6 - box3.min.y;
+
+        this.modelGroup.clear();
+        this.modelGroup.add(instance);
+        this.body.visible = false;
+
+        if (animations.length > 0) {
+          this.mixer = new THREE.AnimationMixer(instance);
+          this.actions.clear();
+          animations.forEach((clip) => {
+            const action = this.mixer!.clipAction(clip);
+            this.actions.set(clip.name, action);
+          });
+        }
+
+        this.setVisualState(this.visualState);
+        if (this.activeClip) this.setAnimationByName(this.activeClip);
+      })
+      .catch((err) => {
+        console.warn("Failed to load engine model", err);
+        this.body.visible = true;
+      });
   }
-
-  getDraggable(): THREE.Object3D {
-    return this.body;
-  }
-}
-
-/* ---------- helpers ---------- */
-
-function makeTextSprite(text: string): THREE.Sprite {
-  const canvas = document.createElement('canvas');
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return new THREE.Sprite(new THREE.SpriteMaterial({ opacity: 0 }));
-
-  const padding = 10;
-  ctx.font = '600 16px system-ui, -apple-system, Segoe UI, Roboto, Arial';
-  const metrics = ctx.measureText(text);
-  const w = Math.ceil(metrics.width) + padding * 2;
-  const h = 40;
-
-  canvas.width = w;
-  canvas.height = h;
-
-  const c = canvas.getContext('2d')!;
-  c.font = '600 16px system-ui, -apple-system, Segoe UI, Roboto, Arial';
-
-  c.fillStyle = 'rgba(15,23,42,0.72)';
-  roundRect(c, 0, 0, w, h, 10);
-  c.fill();
-
-  c.strokeStyle = 'rgba(255,255,255,0.16)';
-  c.lineWidth = 2;
-  roundRect(c, 1, 1, w - 2, h - 2, 9);
-  c.stroke();
-
-  c.fillStyle = 'rgba(255,255,255,0.95)';
-  c.textBaseline = 'middle';
-  c.fillText(text, padding, h / 2);
-
-  const tex = new THREE.CanvasTexture(canvas);
-  tex.minFilter = THREE.LinearFilter;
-
-  const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, depthWrite: false });
-  const sprite = new THREE.Sprite(mat);
-
-  const scale = 0.02;
-  sprite.scale.set(w * scale, h * scale, 1);
-
-  return sprite;
-}
-
-function roundRect(
-  ctx: CanvasRenderingContext2D,
-  x: number,
-  y: number,
-  w: number,
-  h: number,
-  r: number
-) {
-  const rr = Math.min(r, w / 2, h / 2);
-  ctx.beginPath();
-  ctx.moveTo(x + rr, y);
-  ctx.arcTo(x + w, y, x + w, y + h, rr);
-  ctx.arcTo(x + w, y + h, x, y + h, rr);
-  ctx.arcTo(x, y + h, x, y, rr);
-  ctx.arcTo(x, y, x + w, y, rr);
-  ctx.closePath();
 }

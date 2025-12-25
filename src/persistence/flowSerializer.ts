@@ -1,27 +1,22 @@
 import { FlowGraphV1 } from './types';
-import { SubstanceType } from '../core/Substance';
-import { emptyBag } from '../runtime/SubstanceBag';
-import { NodeState } from '../runtime/NodeState';
-import { Simulation } from '../runtime/Simulation';
-
 import { BasicNode } from '../nodes/BasicNode';
 import { RouterNode } from '../nodes/RouterNode';
-import { PipelineObject } from '../objects/PipelineObject';
-
-import * as THREE from 'three';
 
 export function serializeFlow(params: {
   nodes: Array<BasicNode | RouterNode>;
   edges: Array<{
     id: string;
     from: string;
+    fromPortId?: string;
     to: string;
+    toPortId?: string;
+    points?: Array<{ x: number; y: number; z: number }>;
+    monitorPoints?: Array<{ id: string; label?: string; t: number; metric?: string; thresholds?: { low?: number; high?: number; flash?: boolean } }>;
     capacityPerSec: number;
     delaySec: number;
   }>;
-  sim: Simulation;
 }): FlowGraphV1 {
-  const { nodes, edges, sim } = params;
+  const { nodes, edges } = params;
 
   return {
     version: 1,
@@ -34,49 +29,37 @@ export function serializeFlow(params: {
           y: n.position.y,
           z: n.position.z,
         },
+        monitorPoints: (n as any).monitorPoints,
+        modelUrl: (n as any).modelUrl,
+        inputs: (n as any).inputs,
+        outputs: (n as any).outputs,
+        animationBindings: (n as any).animationBindings,
       };
 
       if (n instanceof RouterNode) {
         return {
           ...base,
           type: 'router',
-          runtime: {
-            inCapacity: 0,
-            outCapacity: 0,
-            processRatePerSec: 0,
-            startThreshold: 0,
-          },
         };
       }
-
-      const model = sim.nodes.get(n.userData.id)!;
 
       return {
         ...base,
         type: 'basic',
-        runtime: {
-          inCapacity: model.inCapacity,
-          outCapacity: model.outCapacity,
-          processRatePerSec: model.processRatePerSec,
-          startThreshold: model.startThreshold,
-          process: model.process,
-        },
       };
     }),
 
     edges: edges.map((e) => ({
       id: e.id,
       from: e.from,
+      fromPortId: e.fromPortId,
       to: e.to,
+      toPortId: e.toPortId,
+      points: e.points,
+      monitorPoints: e.monitorPoints,
       capacityPerSec: e.capacityPerSec,
       delaySec: e.delaySec,
     })),
 
-    routers: nodes
-      .filter((n) => n instanceof RouterNode)
-      .map((r) => ({
-        id: r.userData.id as string,
-        condition: (r as RouterNode).condition,
-      })),
   };
 }

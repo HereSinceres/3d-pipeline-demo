@@ -1,93 +1,95 @@
-import { NodeState } from './NodeState';
-import { SubstanceBag } from './SubstanceBag';
+import type { SubstanceType } from '../core/Substance';
+
+/* ============================================
+ * Worker protocol & shared types
+ * ========================================= */
+
+export type Vec3 = { x: number; y: number; z: number };
+
+export type NodeType = 'basic' | 'router';
+
+export type MonitorMetricV1 = 'temperature' | 'humidity' | 'flowRate' | 'substance';
+
+export type MonitorThresholdV1 = {
+  low?: number;
+  high?: number;
+  flash?: boolean;
+};
+
+export type NodeMonitorPointV1 = {
+  id: string;
+  label?: string;
+  offset?: Vec3;
+  metric?: MonitorMetricV1;
+  thresholds?: MonitorThresholdV1;
+};
+
+export type EdgeMonitorPointV1 = {
+  id: string;
+  label?: string;
+  t: number;
+  metric?: MonitorMetricV1;
+  thresholds?: MonitorThresholdV1;
+};
+
+export type PortSpecV1 = {
+  id: string;
+  direction: 'in' | 'out';
+  position: Vec3;
+  label?: string;
+};
+
+export type FlowNodeV1 = {
+  id: string;
+  /** ✅ 可编辑展示名：不参与拓扑与 worker key，id 才是唯一主键 */
+  label?: string;
+  type: NodeType;
+  position: Vec3;
+  modelUrl?: string;
+  groupId?: string;
+  inputs?: PortSpecV1[];
+  outputs?: PortSpecV1[];
+  animationBindings?: Array<{
+    clip: string;
+    field: string;
+    op: 'eq' | 'gt' | 'lt';
+    value: number | string | boolean;
+  }>;
+  // 可选：监控点（局部坐标）
+  monitorPoints?: NodeMonitorPointV1[];
+};
+
+export type FlowEdgeV1 = {
+  id: string;
+  from: string;
+  fromPortId?: string;
+  to: string;
+  toPortId?: string;
+  // 可选：折线路径（世界坐标），不包含 from/to 端点
+  points?: Vec3[];
+  // 可选：监控点（沿管线的比例位置）
+  monitorPoints?: EdgeMonitorPointV1[];
+  capacityPerSec: number;
+  delaySec: number;
+};
+
+export type MonitorValueV1 = {
+  temperature?: number; // °C
+  humidity?: number; // %
+  flowRate?: number; // arbitrary unit
+  substance?: SubstanceType;
+  color?: number; // 0xRRGGBB
+  running?: boolean;
+};
+
+export type FlowMonitoringV1 = {
+  points: Record<string, MonitorValueV1>;
+  nodes?: Record<string, { running?: boolean; data?: Record<string, number | string | boolean> }>;
+};
 
 export type FlowGraphV1 = {
   version: 1;
-  nodes: Array<{
-    id: string;
-    type: 'basic' | 'router';
-    position: { x: number; y: number; z: number };
-    runtime?: {
-      inCapacity: number;
-      outCapacity: number;
-      processRatePerSec: number;
-      startThreshold: number;
-      process?: { yield: Record<string, Record<string, number>> };
-    };
-  }>;
-  edges: Array<{
-    id: string;
-    from: string;
-    to: string;
-    capacityPerSec: number;
-    delaySec: number;
-  }>;
-  routers?: Array<{ id: string; condition: boolean }>;
-};
-
-export type SimInitMsg = { type: 'SIM_INIT'; graph: FlowGraphV1 };
-export type SimSetRouterMsg = { type: 'SIM_SET_ROUTER'; id: string; condition: boolean };
-export type SimFeedMsg = { type: 'SIM_FEED'; nodeId: string; bag: SubstanceBag };
-export type SimSetRunningMsg = { type: 'SIM_SET_RUNNING'; running: boolean };
-export type SimSetRateMsg = {
-  type: 'SIM_SET_RATE';
-  tickHz?: number;
-  publishHz?: number;
-  // 大图可调：每次 publish 是否发送 ids（默认只在 init 后发送一次）
-  publishIds?: boolean;
-};
-
-export type SimMsg =
-  | SimInitMsg
-  | SimSetRouterMsg
-  | SimFeedMsg
-  | SimSetRunningMsg
-  | SimSetRateMsg;
-
-export type SimReady = {
-  type: 'SIM_READY';
-  nodeIds: string[];
-  edgeIds: string[];
-};
-
-export type SimError = { type: 'SIM_ERROR'; message: string };
-
-/**
- * 二进制快照（大图优化）：
- * - states: Int8Array (NodeState enum index)
- * - inTotal/outTotal/liquidIn/gasOut: Float32Array
- * - edgeActive: Int8Array (0/1)
- * - edgeInFlight: Float32Array
- */
-export type SimSnapshotBin = {
-  type: 'SIM_SNAPSHOT_BIN';
-  time: number;
-
-  // 可选：仅在 publishIds=true 时发送
-  nodeIds?: string[];
-  edgeIds?: string[];
-
-  nodeStates: ArrayBuffer;     // Int8Array
-  nodeInTotal: ArrayBuffer;    // Float32Array
-  nodeOutTotal: ArrayBuffer;   // Float32Array
-  nodeLiquidIn: ArrayBuffer;   // Float32Array
-  nodeGasOut: ArrayBuffer;     // Float32Array
-
-  edgeActive: ArrayBuffer;     // Int8Array
-  edgeInFlight: ArrayBuffer;   // Float32Array
-};
-
-export type SimOutMsg = SimReady | SimError | SimSnapshotBin;
-
-// 主线程侧：把 NodeState 映射成 Int8
-export const NodeStateToCode: Record<NodeState, number> = {
-  [NodeState.IDLE]: 0,
-  [NodeState.RUNNING]: 1,
-  [NodeState.BLOCKED]: 2,
-};
-
-export const CodeToNodeState: Record<number, NodeState> = {
-  0: NodeState.IDLE,
-  1: NodeState.RUNNING,
-  2: NodeState.BLOCKED,
+  nodes: FlowNodeV1[];
+  edges: FlowEdgeV1[];
+  groups?: Array<{ id: string; name: string; parentId?: string }>;
 };

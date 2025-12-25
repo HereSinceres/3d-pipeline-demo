@@ -11,11 +11,12 @@ function resolveWorldPosition(src: PositionLike, out: THREE.Vector3) {
 export class PipelineObject extends THREE.Object3D {
   private from: PositionLike;
   private to: PositionLike;
+  private waypoints: THREE.Vector3[];
 
   private tubeMesh: THREE.Mesh;
   private tubeMat: THREE.MeshStandardMaterial;
 
-  private curve: THREE.CatmullRomCurve3;
+  private curve: THREE.Curve<THREE.Vector3>;
   private tubeGeo: THREE.TubeGeometry;
 
   private markers: THREE.Mesh[] = [];
@@ -24,11 +25,12 @@ export class PipelineObject extends THREE.Object3D {
   private active = true;
   private flowLevel = 1; // 0..1
 
-  constructor(from: PositionLike, to: PositionLike, substance: SubstanceType) {
+  constructor(from: PositionLike, to: PositionLike, substance: SubstanceType, waypoints: THREE.Vector3[] = []) {
     super();
 
     this.from = from;
     this.to = to;
+    this.waypoints = waypoints.map((p) => p.clone());
 
     this.curve = new THREE.CatmullRomCurve3([
       new THREE.Vector3(),
@@ -36,7 +38,7 @@ export class PipelineObject extends THREE.Object3D {
       new THREE.Vector3(),
     ]);
 
-    this.tubeGeo = new THREE.TubeGeometry(this.curve, 48, 0.26, 14, false);
+    this.tubeGeo = new THREE.TubeGeometry(this.curve, 48, 0.26, 23, false);
 
     this.tubeMat = new THREE.MeshStandardMaterial({
       color: SubstanceColor[substance],
@@ -45,7 +47,7 @@ export class PipelineObject extends THREE.Object3D {
       roughness: 0.55,
       metalness: 0.05,
       transparent: true,
-      opacity: 0.95,
+      opacity: 0.55,
     });
 
     this.tubeMesh = new THREE.Mesh(this.tubeGeo, this.tubeMat);
@@ -84,6 +86,11 @@ export class PipelineObject extends THREE.Object3D {
     this.flowLevel = Math.max(0, Math.min(1, level01));
   }
 
+  setWaypoints(points: THREE.Vector3[]) {
+    this.waypoints = points.map((p) => p.clone());
+    this.rebuild();
+  }
+
   private rebuild() {
     const a = new THREE.Vector3();
     const b = new THREE.Vector3();
@@ -93,8 +100,17 @@ export class PipelineObject extends THREE.Object3D {
 
     if (a.distanceToSquared(b) < 1e-6) b.x += 0.001;
 
-    const mid = a.clone().lerp(b, 0.5).add(new THREE.Vector3(0, 2.0, 0));
-    this.curve = new THREE.CatmullRomCurve3([a, mid, b]);
+    if (this.waypoints.length > 0) {
+      const pts = [a, ...this.waypoints.map((p) => p.clone()), b];
+      const path = new THREE.CurvePath<THREE.Vector3>();
+      for (let i = 0; i < pts.length - 1; i++) {
+        path.add(new THREE.LineCurve3(pts[i], pts[i + 1]));
+      }
+      this.curve = path;
+    } else {
+      const mid = a.clone().lerp(b, 0.5).add(new THREE.Vector3(0, 2.0, 0));
+      this.curve = new THREE.CatmullRomCurve3([a, mid, b]);
+    }
 
     this.tubeGeo.dispose();
     this.tubeGeo = new THREE.TubeGeometry(this.curve, 48, 0.26, 14, false);
@@ -119,5 +135,28 @@ export class PipelineObject extends THREE.Object3D {
       this.curve.getPointAt(t, tmp);
       this.markers[i].position.copy(tmp);
     }
+  }
+
+  getPointAt(t: number, out: THREE.Vector3 = new THREE.Vector3()) {
+    this.curve.getPointAt(t, out);
+    return out;
+  }
+
+  getTAtPoint(point: THREE.Vector3, steps: number = 80) {
+    let bestT = 0;
+    let bestDist = Number.POSITIVE_INFINITY;
+    const tmp = new THREE.Vector3();
+
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      this.curve.getPointAt(t, tmp);
+      const d = tmp.distanceToSquared(point);
+      if (d < bestDist) {
+        bestDist = d;
+        bestT = t;
+      }
+    }
+
+    return bestT;
   }
 }
